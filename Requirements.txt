@@ -1,0 +1,13 @@
+# Core NovaSure Platform & UI Dependencies
+streamlit>=1.30.0
+pandas>=2.0.0
+matplotlib>=3.8.0
+numpy>=1.24.0
+
+# Optional: MySQL Enterprise Database Engine
+pymysql>=1.1.0
+cryptography>=41.0.0
+
+# Optional: PostgreSQL / SQLAlchemy Cloud Backend (AWS RDS, Supabase)
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
