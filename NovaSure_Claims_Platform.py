@@ -170,11 +170,24 @@ if app_zone == "📁 Claims Zone":
         recent_df = db.get_recent_claims(limit=limit_val)
         
         # Display Metrics
+        # MySQL/SQLite drivers may return numeric columns as strings; normalize
+        # the reserve column before performing arithmetic or numeric formatting.
+        if not recent_df.empty and "total_incurred" in recent_df.columns:
+            reserve_values = pd.to_numeric(
+                recent_df["total_incurred"].astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False),
+                errors="coerce",
+            ).fillna(0)
+            total_reserve = float(reserve_values.sum())
+            average_reserve = float(reserve_values.mean())
+        else:
+            total_reserve = 0.0
+            average_reserve = 0.0
+
         rm1, rm2, rm3, rm4 = st.columns(4)
         rm1.metric("Fetched Records", len(recent_df))
-        rm2.metric("Total Reserve Pool", f"${recent_df['total_incurred'].sum():,.0f}" if not recent_df.empty else "$0")
+        rm2.metric("Total Reserve Pool", f"${total_reserve:,.0f}")
         rm3.metric("Unique Insureds", recent_df["insured_entity"].nunique() if not recent_df.empty else 0)
-        rm4.metric("Avg Reserve", f"${recent_df['total_incurred'].mean():,.0f}" if not recent_df.empty else "$0")
+        rm4.metric("Avg Reserve", f"${average_reserve:,.0f}")
         
         st.dataframe(recent_df, use_container_width=True, hide_index=True)
 
@@ -685,7 +698,11 @@ elif app_zone == "📊 Dashboard Zone":
     k1.metric("Intake Cycle Time", "3.2 Hours", "-87% (Was 2.5 Days)")
     k2.metric("Clerical Error Rate", "1.1%", "-7.1% vs Manual Baseline")
     k3.metric("Total Active Claims", f"{kpis['total_claims']:,}")
-    k4.metric("Total Incurred Reserves", f"${kpis['total_incurred']:,.0f}")
+    dashboard_total_incurred = pd.to_numeric(
+        pd.Series([kpis.get("total_incurred", 0)]).astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False),
+        errors="coerce",
+    ).fillna(0).iloc[0]
+    k4.metric("Total Incurred Reserves", f"${float(dashboard_total_incurred):,.0f}")
     
     st.divider()
     
