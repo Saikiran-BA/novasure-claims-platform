@@ -1,755 +1,515 @@
-import streamlit as st
-import pandas as pd
-import datetime
-import io
+"""
+Secure Product Catalog Web App for AWS 3-Tier Architecture
+---------------------------------------------------------
+Flask application with:
+- Professional login page and post-login application shell
+- No public self-registration
+- Password hashing (Werkzeug PBKDF2)
+- Session-based authentication
+- Admin-only user creation and deactivation
+- Protected product list and create API
+- MySQL/Amazon Aurora support
+- CSRF protection for form submissions and state-changing API requests
+
+Install:
+    pip install Flask mysql-connector-python
+
+Required environment variables:
+    DB_HOST       Aurora writer endpoint
+    DB_USER       Database username
+    DB_PASSWORD   Database password
+    DB_NAME       Database name (default: catalogdb)
+    SECRET_KEY    Long random secret (required for production)
+
+Optional first-run administrator bootstrap:
+    ADMIN_USERNAME
+    ADMIN_PASSWORD
+
+The app creates its tables automatically. If ADMIN_USERNAME and ADMIN_PASSWORD
+are set, it creates that admin account if it does not already exist.
+
+For production:
+- Set COOKIE_SECURE=1 and serve the site over HTTPS.
+- Prefer retrieving DB credentials and SECRET_KEY from AWS Secrets Manager.
+- Put the app behind an HTTPS-enabled ALB.
+- Do not expose the app port directly to the internet.
+"""
+
+import hmac
 import os
-import matplotlib.pyplot as plt
-import database as db
+import re
+import secrets
+from datetime import timedelta
+from functools import wraps
 
-# --- Initialize Backend Database (Supports MySQL & SQLite) ---
-db.init_db()
+from mysql.connector import IntegrityError
+from database import db_connect, execute, init_db, query_all, query_one
+from flask import (
+    Flask, abort, flash, jsonify, redirect, render_template_string,
+    request, session, url_for
+)
+from werkzeug.security import check_password_hash, generate_password_hash
 
-# --- Enterprise Layout Configuration ---
-st.set_page_config(
-    page_title="NovaSure Claims Platform | Enterprise Portal",
-    page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+
+APP_NAME = os.getenv("APP_NAME", "Northstar Workspace")
+SECRET_KEY = os.getenv("SECRET_KEY", "")
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+# HTTPS cookies default on in production; set COOKIE_SECURE=0 only for local HTTP testing.
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1" if APP_ENV == "production" else "0") == "1"
+
+if APP_ENV == "production" and len(SECRET_KEY) < 32:
+    raise RuntimeError(
+        "Production requires SECRET_KEY to be set to a long random value "
+        "(at least 32 characters). Retrieve it from AWS Secrets Manager."
+    )
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=COOKIE_SECURE,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+    MAX_CONTENT_LENGTH=1 * 1024 * 1024,
+    SESSION_REFRESH_EACH_REQUEST=True,
 )
 
-# Custom SaaS Enterprise Theme Styling
-st.markdown("""
-    <style>
-    .main { background-color: #0e1117; }
-    .stMetric { background-color: #1a1f2c; border: 1px solid #2e384d; border-radius: 8px; padding: 12px; }
-    .badge-p1 { color: #dc2626; font-weight: bold; background: #fee2e2; padding: 2px 8px; border-radius: 4px; }
-    .badge-p2 { color: #d97706; font-weight: bold; background: #fef3c7; padding: 2px 8px; border-radius: 4px; }
-    .badge-p3 { color: #16a34a; font-weight: bold; background: #dcfce7; padding: 2px 8px; border-radius: 4px; }
-    .doc-card { background-color: #1a1f2c; border: 1px solid #2e384d; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
-    .doc-badge { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; margin-right: 6px; }
-    .zone-banner { background: linear-gradient(90deg, #1e293b 0%, #0f172a 100%); border-left: 4px solid #3b82f6; padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; }
-    </style>
-""", unsafe_allow_html=True)
 
-# Fetch current live database status
-kpis = db.get_dashboard_kpis()
-active_engine_name = "🟢 MySQL Enterprise (3306)" if kpis.get("active_backend") == "mysql" else "📁 SQLite Engine (Local)"
+@app.after_request
+def add_security_headers(response):
+    """Add baseline browser protections; deploy behind HTTPS in production."""
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cache-Control", "no-store")
+    if APP_ENV == "production":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
-# --- Global Sidebar (System Metadata & Navigation Zones) ---
-with st.sidebar:
-    st.image("https://img.icons8.com/color/96/shield.png", width=64)
-    st.title("NovaSure Suite")
-    st.caption("Core Claims Intake & Adjudication System")
-    st.caption(f"Release: `v3.0-Production` | Engine: `{active_engine_name}`")
-    
-    st.divider()
-    app_zone = st.radio(
-        "Application Zones",
-        [
-            "📁 Claims Zone",
-            "🏢 Maintenance Zone",
-            "🔐 Security Zone",
-            "📊 Dashboard Zone"
-        ]
+
+def csrf_token():
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return token
+
+
+app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+@app.before_request
+def enforce_csrf():
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        expected = session.get("_csrf_token", "")
+        supplied = request.form.get("_csrf_token", "")
+        if request.is_json:
+            supplied = request.headers.get("X-CSRF-Token", "")
+        if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+            abort(400, description="Invalid or missing CSRF token.")
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user_id = session.get("user_id")
+        if not user_id:
+            if request.path.startswith("/api/"):
+                return jsonify(error="Authentication required"), 401
+            return redirect(url_for("login", next=request.full_path))
+        user = query_one(
+            "SELECT id, username, display_name, role, is_active "
+            "FROM app_users WHERE id = %s",
+            (user_id,),
+        )
+        if not user or not user["is_active"]:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify(error="Account is inactive or unavailable"), 401
+            return redirect(url_for("login"))
+        request.current_user = user
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def admin_required(view):
+    @wraps(view)
+    @login_required
+    def wrapped(*args, **kwargs):
+        if request.current_user["role"] != "admin":
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapped
+
+
+BASE_STYLE = """
+:root{--bg:#0b1020;--panel:#111a2e;--panel2:#17233c;--line:#273653;
+--text:#edf3ff;--muted:#9aabc7;--accent:#7c9cff;--accent2:#9a7cff;
+--good:#70e1b0;--danger:#ff8e9b}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(ellipse at top,#18274a 0%,#0b1020 55%);
+color:var(--text);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh}
+a{color:#b9c9ff;text-decoration:none}
+a:hover{text-decoration:underline}
+button,.button{border:0;border-radius:10px;background:linear-gradient(135deg,#7898ff,#9a7cff);
+color:#fff;font-weight:700;padding:11px 16px;cursor:pointer;display:inline-block}
+button:hover,.button:hover{filter:brightness(1.08);text-decoration:none}
+input,select{width:100%;background:#0c1427;border:1px solid #344463;color:var(--text);
+padding:12px;border-radius:9px;outline:none}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #7c9cff22}
+label{display:block;font-size:13px;color:#b8c6df;margin:14px 0 6px}
+.small{font-size:12px;color:var(--muted)}
+.muted{color:var(--muted)}
+.card{background:#111a2eeF;border:1px solid var(--line);border-radius:18px;
+box-shadow:0 18px 60px #0003}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:.2px}
+.brand-mark{height:36px;width:36px;border-radius:11px;display:grid;place-items:center;
+background:linear-gradient(135deg,#7898ff,#a47cff);font-size:18px}
+.flash{border:1px solid #ff8e9b55;background:#ff8e9b12;color:#ffd5da;padding:10px 12px;
+border-radius:10px;margin:12px 0}
+"""
+LOGIN_TEMPLATE = r"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in · {{ app_name }}</title><style>""" + BASE_STYLE + r"""
+.login-wrap{min-height:100vh;display:grid;grid-template-columns:1.1fr .9fr;max-width:1200px;margin:auto;padding:30px;gap:35px;align-items:center}
+.hero{padding:30px 10px 30px 20px}.hero h1{font-size:clamp(36px,5vw,62px);line-height:1.06;letter-spacing:-2px;margin:28px 0 18px}
+.gradient{background:linear-gradient(100deg,#fff,#aebfff 55%,#c7aaff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{max-width:500px;color:#a9b8d2;font-size:17px}.eyebrow{color:#aebfff;font-size:12px;letter-spacing:2px;font-weight:800}
+.features{display:flex;gap:10px;flex-wrap:wrap;margin-top:30px}.pill{border:1px solid #344463;background:#ffffff08;color:#b9c7df;border-radius:99px;padding:7px 11px;font-size:12px}
+.login-card{padding:34px;max-width:430px;width:100%;justify-self:center}
+.login-card h2{margin:25px 0 4px;font-size:26px}.login-card p{margin:0;color:var(--muted)}
+.login-card button{width:100%;margin-top:22px;padding:13px}
+.input-wrap{position:relative}.input-wrap input{padding-right:50px}
+.toggle{position:absolute;right:7px;top:7px;background:transparent;color:#aab9d5;padding:6px 8px;font-size:12px}
+.secure-note{display:flex;gap:8px;align-items:center;margin-top:20px;color:#94a5c1;font-size:12px}
+@media(max-width:780px){.login-wrap{grid-template-columns:1fr;padding:20px}.hero{padding:20px 5px 0}.hero h1{font-size:42px}.login-card{max-width:none}.features{margin-top:18px}}
+</style></head><body><main class="login-wrap">
+<section class="hero">
+<div class="brand"><div class="brand-mark">N</div><span>{{ app_name }}</span></div>
+<div class="eyebrow" style="margin-top:65px">YOUR WORKSPACE. YOUR DATA.</div>
+<h1>Everything you need.<br><span class="gradient">One secure place.</span></h1>
+<p>Sign in to access your workspace, manage your catalog, and keep your team's work connected.</p>
+<div class="features"><span class="pill">✦ Secure access</span><span class="pill">◈ Team workspace</span><span class="pill">↗ Live catalog</span></div>
+</section>
+<section class="card login-card">
+<div class="brand"><div class="brand-mark">↗</div><span>Workspace access</span></div>
+<h2>Welcome back</h2><p>Enter your credentials to continue.</p>
+{% with messages = get_flashed_messages() %}{% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}{% endwith %}
+<form method="post" action="{{ url_for('login') }}">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="next" value="{{ next_url }}">
+<label for="username">Username</label>
+<input id="username" name="username" autocomplete="username" required autofocus maxlength="80" placeholder="Enter your username">
+<label for="password">Password</label>
+<div class="input-wrap"><input id="password" name="password" type="password" autocomplete="current-password" required placeholder="Enter your password">
+<button class="toggle" type="button" onclick="const p=document.getElementById('password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'Show':'Hide'">Show</button></div>
+<button type="submit">Sign in securely&nbsp; →</button>
+</form>
+<div class="secure-note"><span>🔒</span><span>Authorized users only. Contact your administrator for access.</span></div>
+</section></main></body></html>
+"""
+
+APP_TEMPLATE = r"""
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }} · {{ app_name }}</title><style>""" + BASE_STYLE + r"""
+.layout{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
+aside{padding:24px 16px;border-right:1px solid var(--line);background:#0b1222aa}
+.side-link{display:block;padding:10px 12px;border-radius:9px;color:#aebbd2;margin:5px 0}
+.side-link.active,.side-link:hover{background:#7c9cff18;color:#fff;text-decoration:none}
+main{padding:30px;max-width:1200px;width:100%;margin:0 auto}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:30px}
+.panel{padding:22px;margin:18px 0}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.stat{padding:18px;border:1px solid var(--line);border-radius:14px;background:#ffffff05}
+.stat strong{display:block;font-size:28px;margin-top:6px}
+.row{display:flex;gap:12px;align-items:end;flex-wrap:wrap}
+.row>div{flex:1;min-width:160px}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th,td{text-align:left;padding:13px 10px;border-bottom:1px solid var(--line)}
+th{color:#9faecc;font-size:12px;text-transform:uppercase;letter-spacing:.6px}
+.badge{display:inline-block;padding:4px 8px;border-radius:99px;background:#70e1b01a;color:var(--good);font-size:12px}
+.danger{background:#ff8e9b18;color:#ffb2bb}
+.inline{display:inline}
+.inline button{padding:7px 10px;font-size:12px}
+@media(max-width:760px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}main{padding:18px}.grid{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
+</style></head><body><div class="layout">
+<aside><div class="brand" style="margin:5px 8px 30px"><div class="brand-mark">N</div><span>{{ app_name }}</span></div>
+<div class="small" style="padding:0 12px">WORKSPACE</div>
+<a class="side-link {{ 'active' if active == 'dashboard' else '' }}" href="{{ url_for('dashboard') }}">◫ &nbsp; Overview</a>
+<a class="side-link {{ 'active' if active == 'products' else '' }}" href="{{ url_for('dashboard') }}#products">▦ &nbsp; Product catalog</a>
+{% if user.role == 'admin' %}<a class="side-link {{ 'active' if active == 'users' else '' }}" href="{{ url_for('users_page') }}">♙ &nbsp; User access</a>{% endif %}
+<div style="margin-top:50px;border-top:1px solid var(--line);padding:18px 10px">
+<div class="small">SIGNED IN AS</div><strong>{{ user.display_name }}</strong><div class="small">{{ user.role|capitalize }}</div>
+<form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button style="width:100%;margin-top:16px;background:#26334c">Sign out ↗</button></form>
+</div></aside>
+<main><div class="topbar"><div><div class="small">YOUR WORKSPACE / {{ title|upper }}</div><h1 style="margin:5px 0">{{ title }}</h1><div class="muted">A secure place for your team's work.</div></div><span class="badge">● Session active</span></div>
+{% with messages = get_flashed_messages() %}{% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}{% endwith %}
+{{ content|safe }}
+</main></div></body></html>
+"""
+
+
+def page(title, active, content, **context):
+    return render_template_string(
+        APP_TEMPLATE, title=title, active=active, content=content,
+        app_name=APP_NAME, user=request.current_user, **context
     )
-    
-    st.divider()
-    # Live Quick Stats fetched directly from Backend Database
-    st.caption(f"📁 Claims in Backend DB: **{kpis['total_claims']}**")
-    st.caption(f"📎 Registered Attachments: **{kpis['total_docs']}**")
-    st.caption(f"🏢 Linked Entities: **{kpis['total_entities']}**")
-    st.caption(f"👥 Active Users: **{kpis['active_users']}**")
-    st.caption(f"🗄️ Connected Engine: **{kpis.get('active_backend', 'sqlite').upper()}**")
-    st.divider()
-    st.caption("🔒 Session Authenticated: Lead Systems Analyst")
-    st.caption("Tenant: Global Commercial Casualty Ops")
 
 
-# ==========================================================
-# ZONE 1: CLAIMS ZONE
-# ==========================================================
-if app_zone == "📁 Claims Zone":
-    st.markdown("""
-        <div class="zone-banner">
-            <h2 style="color: #60a5fa; margin: 0;">📁 Claims Operations Zone</h2>
-            <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 14px;">
-                Comprehensive claims management lifecycle: manual entry, live repositories, dynamic search, bulk CSV intake, and document handling.
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    claims_tab1, claims_tab2, claims_tab3, claims_tab4, claims_tab5, claims_tab6 = st.tabs([
-        "📝 New Claims (Manual)",
-        "⏱️ Recent Claims Grid",
-        "🔍 Quick Search",
-        "🔎 Advanced Search",
-        "📥 Bulk Upload (CSV FNOL)",
-        "📎 Attachments Upload & Hub"
+@app.route("/health")
+def health():
+    # ALB health check only; intentionally does not expose database details.
+    return jsonify(status="ok")
+
+
+@app.route("/")
+def root():
+    if session.get("user_id"):
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = query_one(
+            "SELECT id, username, display_name, password_hash, role, is_active "
+            "FROM app_users WHERE username = %s",
+            (username,),
+        )
+        if user and user["is_active"] and check_password_hash(
+            user["password_hash"], password
+        ):
+            session.clear()
+            session["user_id"] = user["id"]
+            session.permanent = True
+            csrf_token()
+            next_url = request.form.get("next", "")
+            # Avoid open redirects: only accept local absolute paths.
+            if next_url.startswith("/") and not next_url.startswith("//"):
+                return redirect(next_url.split("#", 1)[0])
+            return redirect(url_for("dashboard"))
+        flash("Sign-in failed. Check your username and password, or contact your administrator.")
+    next_url = request.args.get("next", "")
+    if not (next_url.startswith("/") and not next_url.startswith("//")):
+        next_url = ""
+    return render_template_string(
+        LOGIN_TEMPLATE, app_name=APP_NAME, next_url=next_url
+    )
+
+
+@app.post("/logout")
+@login_required
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.get("/dashboard")
+@login_required
+def dashboard():
+    total_products = query_one("SELECT COUNT(*) AS n FROM products")["n"]
+    total_users = 0
+    if request.current_user["role"] == "admin":
+        total_users = query_one("SELECT COUNT(*) AS n FROM app_users WHERE is_active = TRUE")["n"]
+    products = query_all(
+        "SELECT id, name, price, created_at FROM products ORDER BY id DESC LIMIT 100"
+    )
+    rows = "".join(
+        "<tr><td>{}</td><td>₹{:.2f}</td><td>{}</td></tr>".format(
+            str(p["name"]).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
+            float(p["price"]),
+            p["created_at"].strftime("%Y-%m-%d %H:%M") if p["created_at"] else ""
+        ) for p in products
+    ) or '<tr><td colspan="3" class="muted">No products yet. Add the first one below.</td></tr>'
+    content = """
+    <div class="grid">
+      <div class="stat"><span class="muted">Catalog items</span><strong>{}</strong><span class="small">Stored in Aurora</span></div>
+      <div class="stat"><span class="muted">Access level</span><strong style="font-size:22px">{}</strong><span class="small">Role-based permissions</span></div>
+      <div class="stat"><span class="muted">Workspace status</span><strong style="font-size:22px;color:var(--good)">Online</strong><span class="small">Authenticated session</span></div>
+    </div>
+    <section class="card panel" id="products">
+      <h2 style="margin-top:0">Add a product</h2>
+      <form method="post" action="/products">
+        <input type="hidden" name="_csrf_token" value="{}">
+        <div class="row"><div><label>Product name</label><input name="name" maxlength="150" required placeholder="e.g. Wireless keyboard"></div>
+        <div><label>Price (INR)</label><input name="price" type="number" min="0" step="0.01" required placeholder="799.00"></div>
+        <div style="flex:0 0 auto"><button type="submit">Save product +</button></div></div>
+      </form>
+    </section>
+    <section class="card panel"><h2 style="margin-top:0">Product catalog</h2>
+      <div class="muted">Recent products saved by your workspace.</div>
+      <table><thead><tr><th>Product</th><th>Price</th><th>Created</th></tr></thead><tbody>{}</tbody></table>
+    </section>
+    """.format(total_products, request.current_user["role"].capitalize(), csrf_token(), rows)
+    return page("Overview", "dashboard", content)
+
+
+@app.post("/products")
+@login_required
+def create_product():
+    name = request.form.get("name", "").strip()
+    try:
+        price = float(request.form.get("price", ""))
+    except (TypeError, ValueError):
+        flash("Please enter a valid price.")
+        return redirect(url_for("dashboard") + "#products")
+    if not name or len(name) > 150 or price < 0:
+        flash("Enter a valid product name and non-negative price.")
+        return redirect(url_for("dashboard") + "#products")
+    execute(
+        "INSERT INTO products (name, price, created_by) VALUES (%s, %s, %s)",
+        (name, price, request.current_user["id"]),
+    )
+    flash("Product saved successfully.")
+    return redirect(url_for("dashboard") + "#products")
+
+
+@app.get("/api/products")
+@login_required
+def api_products():
+    rows = query_all(
+        "SELECT id, name, price FROM products ORDER BY id DESC LIMIT 500"
+    )
+    return jsonify([
+        {"id": row["id"], "name": row["name"], "price": float(row["price"])}
+        for row in rows
     ])
-    
-    # ------------------------------------------------------
-    # 1.1 NEW CLAIMS (MANUAL INTAKE FORM)
-    # ------------------------------------------------------
-    with claims_tab1:
-        st.subheader("Manual Digital FNOL Intake Engine")
-        st.caption("Direct schema validation and triage rules persisting into the backend database.")
-        
-        with st.form("manual_claim_intake_form", clear_on_submit=True):
-            st.markdown("##### Section 1: Policy & Loss Classification")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                lob_selection = st.selectbox(
-                    "Line of Business (LOB) *",
-                    [
-                        "GL (General Liability)",
-                        "WC (Workers' Comp)",
-                        "VA (Commercial Vehicle Auto)",
-                        "PD (Commercial Property Damage)"
-                    ]
-                )
-                policy_num = st.text_input("Policy Number *", placeholder="e.g., POL-88391-GL")
-            with c2:
-                # Dynamic entity dropdown from Maintenance Zone
-                entities_df = db.get_all_entities(type_filter=["Insured Corporation"])
-                insured_options = list(entities_df["entity_name"]) if not entities_df.empty else ["Acme Industrial Supply"]
-                insured_name = st.selectbox("Insured Entity *", options=insured_options)
-                loss_date = st.date_input("Date of Loss *", max_value=datetime.date.today())
-            with c3:
-                loss_severity = st.selectbox("Intake Triage Priority", ["Standard (P3)", "High Exposure (P2)", "Critical / Severity A (P1)"])
-                incident_state = st.selectbox("Jurisdiction / Loss State", ["TX", "CA", "NY", "FL", "IL", "OH", "PA", "GA", "NC"])
-
-            st.markdown("##### Section 2: Claimant & Exposure Details")
-            c4, c5, c6 = st.columns(3)
-            with c4:
-                claimant_name = st.text_input("Claimant Full Name *", placeholder="Primary party claiming loss")
-                claimant_rep = st.selectbox("Claimant Representation", ["Pro Se (Unrepresented)", "Represented by Counsel", "Unknown"])
-            with c5:
-                initial_reserve = st.number_input("Initial Incurred Loss Reserve ($) *", min_value=500, max_value=1000000, step=1000, value=15000)
-                subro_flag = st.selectbox("Initial Subrogation Indicator", ["None", "Potential Third-Party Fault", "Defective Product", "Active Recovery"])
-            with c6:
-                assigned_adj = st.selectbox("Assign Initial Adjuster", options=["ADJ-101 (David Chen)", "ADJ-102 (Elena Rostova)", "ADJ-103 (Marcus Sterling)", "ADJ-104 (Rachel Ward)"])
-                initial_lit_status = "Litigation Formal Hold" if claimant_rep == "Represented by Counsel" else "None"
-
-            st.markdown("##### Section 3: Incident Narrative")
-            loss_desc = st.text_area("Detailed First Notice of Loss (FNOL) Summary", placeholder="Enter specific description of incident, damages, and witness references...")
-
-            submit_btn = st.form_submit_button("💾 Ingest Claim into Backend Database", type="primary")
-
-            if submit_btn:
-                if not policy_num or not insured_name or not claimant_name:
-                    st.error("Validation Failed: Mandatory fields (Policy, Insured, Claimant) must be populated.")
-                else:
-                    adj_code = assigned_adj.split(" (")[0]
-                    claim_record = {
-                        "lob": lob_selection,
-                        "policy_number": policy_num,
-                        "insured_entity": insured_name,
-                        "claimant_name": claimant_name,
-                        "loss_date": str(loss_date),
-                        "total_incurred": initial_reserve,
-                        "status": "Open - Adjuster Assigned",
-                        "adjuster_id": adj_code,
-                        "subrogation": subro_flag,
-                        "litigation_status": initial_lit_status,
-                        "priority": loss_severity,
-                        "loss_state": incident_state,
-                        "fnol_narrative": loss_desc if loss_desc else "Manual digital FNOL intake entry."
-                    }
-                    new_id = db.create_claim(claim_record)
-                    st.success(f"✅ Claim **{new_id}** ingested and triaged via Digital Ingestion Rules into **{lob_selection}**!")
-                    st.rerun()
-
-    # ------------------------------------------------------
-    # 1.2 RECENT CLAIMS (GRID VIEW)
-    # ------------------------------------------------------
-    with claims_tab2:
-        st.subheader("Recent Claims Repository (Backend Synchronized)")
-        st.caption("Live records retrieved directly from the relational database.")
-        
-        limit_val = st.slider("Select maximum records to fetch:", min_value=10, max_value=200, value=50, step=10)
-        recent_df = db.get_recent_claims(limit=limit_val)
-        
-        # Display Metrics
-        # MySQL/SQLite drivers may return numeric columns as strings; normalize
-        # the reserve column before performing arithmetic or numeric formatting.
-        if not recent_df.empty and "total_incurred" in recent_df.columns:
-            reserve_values = pd.to_numeric(
-                recent_df["total_incurred"].astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False),
-                errors="coerce",
-            ).fillna(0)
-            total_reserve = float(reserve_values.sum())
-            average_reserve = float(reserve_values.mean())
-        else:
-            total_reserve = 0.0
-            average_reserve = 0.0
-
-        rm1, rm2, rm3, rm4 = st.columns(4)
-        rm1.metric("Fetched Records", len(recent_df))
-        rm2.metric("Total Reserve Pool", f"${total_reserve:,.0f}")
-        rm3.metric("Unique Insureds", recent_df["insured_entity"].nunique() if not recent_df.empty else 0)
-        rm4.metric("Avg Reserve", f"${average_reserve:,.0f}")
-        
-        st.dataframe(recent_df, use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------
-    # 1.3 SEARCH CRITERIA (QUICK SEARCH)
-    # ------------------------------------------------------
-    with claims_tab3:
-        st.subheader("Quick Claims Search")
-        st.caption("Perform fast indexed SQL queries across Claim ID, Policy Number, Insured Entity, and Claimant Name.")
-        
-        search_kw = st.text_input("Enter search keywords:", placeholder="e.g., NS-2026, POL-99214, Omni Logistics, Sarah...")
-        
-        if search_kw:
-            results_df = db.quick_search_claims(search_kw)
-            st.write(f"Found **{len(results_df)}** matching claim records:")
-            if not results_df.empty:
-                st.dataframe(results_df, use_container_width=True, hide_index=True)
-            else:
-                st.warning("No records matched your search query in the backend database.")
-        else:
-            st.info("Type a keyword above to execute a real-time query against the database.")
-
-    # ------------------------------------------------------
-    # 1.4 ADVANCED SEARCH (MULTI-FILTER)
-    # ------------------------------------------------------
-    with claims_tab4:
-        st.subheader("Advanced Multi-Attribute Claim Search")
-        st.caption("Filter claims across LOB, Jurisdiction, Priority, Litigation, and Reserve thresholds.")
-        
-        af1, af2, af3 = st.columns(3)
-        with af1:
-            all_lobs = ["GL (General Liability)", "WC (Workers' Comp)", "VA (Commercial Vehicle Auto)", "PD (Commercial Property Damage)"]
-            adv_lobs = st.multiselect("Lines of Business", options=all_lobs, default=all_lobs)
-            adv_status = st.multiselect("Claim Status", options=["Open - Adjuster Assigned", "Pending Verification", "Closed - Settled"], default=["Open - Adjuster Assigned", "Pending Verification"])
-        with af2:
-            all_states = ["TX", "CA", "NY", "FL", "IL", "OH", "PA", "GA", "NC"]
-            adv_states = st.multiselect("Jurisdiction States", options=all_states, default=all_states)
-            adv_priorities = st.multiselect("Triage Priority", options=["Standard (P3)", "High Exposure (P2)", "Critical / Severity A (P1)"], default=["Standard (P3)", "High Exposure (P2)", "Critical / Severity A (P1)"])
-        with af3:
-            adv_res_range = st.slider("Reserve Amount Range ($)", min_value=0, max_value=500000, value=(0, 250000), step=5000)
-            
-        adv_results = db.advanced_search_claims(
-            lob_list=adv_lobs,
-            status_list=adv_status,
-            state_list=adv_states,
-            priority_list=adv_priorities,
-            min_reserve=adv_res_range[0],
-            max_reserve=adv_res_range[1]
-        )
-        
-        st.markdown(f"##### Results: **{len(adv_results)}** claims matched criteria")
-        st.dataframe(adv_results, use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------
-    # 1.5 BULK UPLOAD (CSV FNOL MASS INGESTION)
-    # ------------------------------------------------------
-    with claims_tab5:
-        st.subheader("Mass Digital FNOL Ingestion Engine")
-        st.caption("Upload mass FNOL CSV datasets covering all intake sections to ingest, validate, and partition claims directly into their designated Lines of Business (LOB).")
-        
-        # Download Template Row
-        sample_csv_data = pd.DataFrame([
-            {
-                "LOB": "GL (General Liability)",
-                "Policy Number": "POL-44109-GL",
-                "Insured Entity": "Pinnacle Warehouse Corp",
-                "Claimant Name": "Robert Langdon",
-                "Loss Date": "2026-10-05",
-                "Total Incurred ($)": 32000,
-                "Priority": "High Exposure (P2)",
-                "Loss State": "OH",
-                "Claimant Representation": "Represented by Counsel",
-                "Subrogation": "Potential Third-Party Fault",
-                "FNOL Narrative": "Customer sustained knee contusion after pallet collapse in aisle 6. Forklift contractor under review."
-            },
-            {
-                "LOB": "WC (Workers' Comp)",
-                "Policy Number": "POL-55218-WC",
-                "Insured Entity": "Summit Steel Erectors",
-                "Claimant Name": "Carlos Mendez",
-                "Loss Date": "2026-10-08",
-                "Total Incurred ($)": 28500,
-                "Priority": "Standard (P3)",
-                "Loss State": "TX",
-                "Claimant Representation": "Pro Se (Unrepresented)",
-                "Subrogation": "None",
-                "FNOL Narrative": "Welder suffered second-degree thermal flash burns to forearm during pipe fitting fabrication."
-            },
-            {
-                "LOB": "VA (Commercial Vehicle Auto)",
-                "Policy Number": "POL-66327-VA",
-                "Insured Entity": "Horizon Express Transport",
-                "Claimant Name": "National Transit Lines",
-                "Loss Date": "2026-10-10",
-                "Total Incurred ($)": 89000,
-                "Priority": "Critical / Severity A (P1)",
-                "Loss State": "CA",
-                "Claimant Representation": "Represented by Counsel",
-                "Subrogation": "Active Recovery",
-                "FNOL Narrative": "Tractor-trailer rear-ended by adverse commercial bus on Highway 99 during heavy rain. Chassis damage."
-            },
-            {
-                "LOB": "PD (Commercial Property Damage)",
-                "Policy Number": "POL-77436-PD",
-                "Insured Entity": "Crestview Cold Storage",
-                "Claimant Name": "Crestview Real Estate Group",
-                "Loss Date": "2026-10-12",
-                "Total Incurred ($)": 64000,
-                "Priority": "High Exposure (P2)",
-                "Loss State": "FL",
-                "Claimant Representation": "Pro Se (Unrepresented)",
-                "Subrogation": "Defective Product",
-                "FNOL Narrative": "Ammonia refrigerant valve ruptured inside freezer room #2, spoiling 14 pallets of seafood."
-            }
-        ])
-        
-        bc1, bc2 = st.columns([2, 1])
-        with bc1:
-            st.info("💡 **Enterprise Ingestion Schema**: Normalized against Policy, Claimant, Exposure, Triage Priority, Jurisdiction State, Reserves, Subrogation, and Loss Narrative.")
-        with bc2:
-            buf = io.StringIO()
-            sample_csv_data.to_csv(buf, index=False)
-            st.download_button(
-                label="📥 Download Master FNOL CSV Template",
-                data=buf.getvalue(),
-                file_name="NovaSure_FNOL_Bulk_Intake_Template.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-            
-        up_file = st.file_uploader("Upload Bulk FNOL CSV File", type=["csv"])
-        load_demo_btn = st.button("⚡ Load Ready-to-Use 4-Claim Mass Dataset")
-        
-        parsed_df = None
-        if up_file:
-            parsed_df = pd.read_csv(up_file)
-            st.success(f"File **{up_file.name}** parsed successfully ({len(parsed_df)} rows).")
-        elif load_demo_btn:
-            parsed_df = sample_csv_data.copy()
-            st.success("Loaded pre-validated mass intake dataset across GL, WC, VA, and PD!")
-            
-        if parsed_df is not None:
-            st.markdown("#### Pre-Ingestion Data Preview")
-            st.dataframe(parsed_df, use_container_width=True, hide_index=True)
-            
-            if st.button("🚀 Ingest & Import All Claims into Backend Database", type="primary"):
-                imported_ids = db.bulk_import_claims_from_df(parsed_df)
-                st.balloons()
-                st.success(f"🎉 Successfully ingested **{len(imported_ids)} mass claims** into SQL DB! Assigned IDs: `{', '.join(imported_ids[:10])}...`")
-                st.rerun()
-
-    # ------------------------------------------------------
-    # 1.6 ATTACHMENTS UPLOAD & WORKBENCH
-    # ------------------------------------------------------
-    with claims_tab6:
-        st.subheader("Enterprise Claim Attachment & Document Center")
-        st.caption("Upload, index, preview, download, dispatch via secure email, and edit documents associated with claims across all Lines of Business.")
-        
-        # Upload Form
-        with st.expander("📤 Upload New Claim Attachment", expanded=True):
-            with st.form("att_upload_form", clear_on_submit=True):
-                a_c1, a_c2, a_c3 = st.columns(3)
-                with a_c1:
-                    att_title = st.text_input("Title *", placeholder="e.g., Police Report - Unit 3 Collision")
-                    att_class = st.selectbox(
-                        "Class of Document *",
-                        ["Evidence & Investigation", "Medical & Health Records", "Legal & Pleadings", "Financial & Proof of Loss", "Policy & Contracts", "Regulatory & Compliance", "Adjuster Field Notes"]
-                    )
-                with a_c2:
-                    att_type = st.selectbox(
-                        "Type of Document *",
-                        ["PDF Document", "Photographic Image", "Spreadsheet / Loss Run", "Word Doc / Text", "Digital Notice / Email"]
-                    )
-                    att_lob = st.selectbox(
-                        "LOB Type *",
-                        ["GL (General Liability)", "WC (Workers' Comp)", "VA (Commercial Vehicle Auto)", "PD (Commercial Property Damage)", "Cross-LOB / Commercial Package"]
-                    )
-                with a_c3:
-                    att_claim_type = st.selectbox(
-                        "Claim Type *",
-                        ["Bodily Injury", "Property Damage", "Catastrophic / High Exposure", "Workers' Indemnity & Lost Time", "Subrogation / Third-Party Recovery", "Uninsured Motorist", "Environmental / Hazmat"]
-                    )
-                    recent_claims_for_picker = db.get_recent_claims(50)
-                    claim_picker_options = ["General / Unassigned"] + list(recent_claims_for_picker["claim_id"] + " (" + recent_claims_for_picker["insured_entity"] + ")")
-                    assoc_claim = st.selectbox("Associated Claim File", options=claim_picker_options)
-                    
-                a_c4, a_c5 = st.columns([2, 1])
-                with a_c4:
-                    uploaded_doc_file = st.file_uploader("Select Attachment File", type=["pdf", "png", "jpg", "jpeg", "csv", "txt", "docx", "xlsx"])
-                with a_c5:
-                    att_status = st.selectbox("Verification Status", ["Verified & Stamped", "Under Legal Review", "Pending Adjuster Review"])
-                    
-                att_notes = st.text_area("Adjuster Dossier Notes", placeholder="Provide chain of custody, witness references, or context...")
-                
-                upload_doc_btn = st.form_submit_button("📁 Upload & Register Document to Database", type="primary")
-                
-                if upload_doc_btn:
-                    if not att_title:
-                        st.error("Validation Error: 'Title' is mandatory.")
-                    else:
-                        existing_docs = db.get_all_documents()
-                        new_doc_id = f"DOC-2026-{len(existing_docs) + 1:03d}"
-                        claim_ref = "Unassigned" if assoc_claim == "General / Unassigned" else assoc_claim.split(" (")[0]
-                        
-                        if uploaded_doc_file is not None:
-                            f_bytes = uploaded_doc_file.getvalue()
-                            f_name = uploaded_doc_file.name
-                            m_type = uploaded_doc_file.type or "application/octet-stream"
-                        else:
-                            f_name = f"{att_title.lower().replace(' ', '_')[:24]}.pdf" if "PDF" in att_type else f"{att_title.lower().replace(' ', '_')[:24]}.txt"
-                            content_str = (
-                                f"NOVASURE CLAIMS PLATFORM - ELECTRONIC RECORD ARCHIVE\n"
-                                f"Document ID: {new_doc_id}\n"
-                                f"Title: {att_title}\n"
-                                f"Class: {att_class} | Type: {att_type}\n"
-                                f"LOB: {att_lob} | Claim Type: {att_claim_type}\n"
-                                f"Claim Ref: {claim_ref}\n"
-                                f"Notes: {att_notes}\n"
-                                f"Certified on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            )
-                            f_bytes = content_str.encode("utf-8")
-                            m_type = "application/pdf" if "PDF" in att_type else "text/plain"
-                            
-                        db.save_document_attachment(
-                            doc_id=new_doc_id,
-                            file_name=f_name,
-                            file_bytes=f_bytes,
-                            mime_type=m_type,
-                            metadata={
-                                "title": att_title,
-                                "class_of_document": att_class,
-                                "type_of_document": att_type,
-                                "lob_type": att_lob,
-                                "claim_type": att_claim_type,
-                                "claim_id": claim_ref,
-                                "status": att_status,
-                                "notes": att_notes
-                            }
-                        )
-                        st.success(f"✅ Document successfully uploaded & registered in database! ID: **{new_doc_id}** | File: `{f_name}`")
-                        st.rerun()
-
-        st.divider()
-        st.markdown("#### 📂 Master Attachment Repository Grid")
-        
-        # Grid Filters
-        gf1, gf2, gf3, gf4 = st.columns(4)
-        with gf1:
-            f_lobs = st.multiselect("Filter by LOB", options=["GL (General Liability)", "WC (Workers' Comp)", "VA (Commercial Vehicle Auto)", "PD (Commercial Property Damage)"])
-        with gf2:
-            f_classes = st.multiselect("Filter by Class", options=["Evidence & Investigation", "Medical & Health Records", "Legal & Pleadings", "Policy & Contracts"])
-        with gf3:
-            f_claim = st.text_input("Filter by Claim ID", placeholder="e.g., NS-2026-001")
-        with gf4:
-            f_search = st.text_input("Search Title / Notes", placeholder="e.g., Police, Fracture...")
-            
-        docs_df = db.get_all_documents(
-            lob_filter=f_lobs if f_lobs else None,
-            class_filter=f_classes if f_classes else None,
-            claim_id=f_claim if f_claim else None,
-            search=f_search if f_search else None
-        )
-        
-        st.dataframe(docs_df[["document_id", "title", "class_of_document", "type_of_document", "lob_type", "claim_type", "claim_id", "file_name", "file_size", "upload_timestamp", "status"]], use_container_width=True, hide_index=True)
-        
-        st.divider()
-        st.subheader("🛠️ Document Operations: Preview, Download, Email, Edit")
-        
-        if docs_df.empty:
-            st.warning("No documents available under current filters.")
-        else:
-            doc_opts = list(docs_df["document_id"] + " - " + docs_df["title"])
-            chosen_doc = st.selectbox("Select Target Document for Operational Action:", options=doc_opts)
-            target_id = chosen_doc.split(" - ")[0]
-            target_row = docs_df[docs_df["document_id"] == target_id].iloc[0]
-            
-            act1, act2, act3, act4 = st.tabs(["👁️ Preview", "⬇️ Download", "📧 Email", "✏️ Edit Metadata"])
-            
-            # Action 1: Preview
-            with act1:
-                st.markdown(f"#### Preview: `{target_row['document_id']}` — {target_row['title']}")
-                p_c1, p_c2, p_c3, p_c4 = st.columns(4)
-                p_c1.metric("Class", target_row["class_of_document"])
-                p_c2.metric("Type", target_row["type_of_document"])
-                p_c3.metric("LOB & Claim Type", target_row["lob_type"][:12] + "..", target_row["claim_type"])
-                p_c4.metric("Status", target_row["status"])
-                
-                if "Image" in target_row["type_of_document"]:
-                    st.markdown(
-                        f"""
-                        <div style="background-color: #111827; border: 2px dashed #374151; border-radius: 8px; padding: 24px; text-align: center;">
-                            <img src="https://img.icons8.com/color/144/image.png" width="96" style="margin-bottom: 12px;" />
-                            <h4 style="color: #f9fafb; margin: 0;">{target_row['title']}</h4>
-                            <p style="color: #9ca3af; font-size: 13px;">File: {target_row['file_name']} | Size: {target_row['file_size']}</p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-                else:
-                    st.markdown(
-                        f"""
-                        <div style="background-color: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 20px; font-family: monospace;">
-                            <span style="color: #38bdf8; font-weight: bold;">[NOVASURE CERTIFIED ELECTRONIC DOCUMENT]</span>
-                            <hr style="border-color: #334155; margin: 8px 0;" />
-                            <p style="color: #e2e8f0; font-size: 13px;"><b>Title:</b> {target_row['title']} | <b>Claim ID:</b> {target_row['claim_id']}</p>
-                            <p style="color: #cbd5e1; font-size: 13px;"><b>Notes:</b> {target_row['notes']}</p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-                    
-            # Action 2: Download
-            with act2:
-                file_bytes, file_name, mime_type = db.read_attachment_file(target_id)
-                if file_bytes:
-                    st.write(f"📁 **File:** `{file_name}` | 📊 **Size:** `{target_row['file_size']}`")
-                    st.download_button(
-                        label=f"⬇️ Download {file_name}",
-                        data=file_bytes,
-                        file_name=file_name,
-                        mime=mime_type,
-                        type="primary"
-                    )
-                else:
-                    st.warning("Binary file not found on disk.")
-                    
-            # Action 3: Email
-            with act3:
-                with st.form(f"email_form_{target_id}"):
-                    rec_email = st.text_input("Recipient Email *", placeholder="counsel@firm.com, claims@novasure.internal")
-                    em_subject = st.text_input("Subject", value=f"[NovaSure Claims Document] {target_row['title']} (Claim: {target_row['claim_id']})")
-                    em_body = st.text_area("Message Body", value=f"Attached is the claims document '{target_row['title']}' regarding Claim {target_row['claim_id']}.")
-                    if st.form_submit_button("📤 Dispatch Document via Email", type="primary"):
-                        if not rec_email or "@" not in rec_email:
-                            st.error("Please enter a valid recipient email.")
-                        else:
-                            db.log_email_dispatch(rec_email, target_row["document_id"], target_row["claim_id"], em_subject)
-                            st.success(f"📧 Email successfully dispatched to **{rec_email}**! Logged in database audit trail.")
-                            
-                st.markdown("##### Recent Email Transmission Audit Log")
-                st.dataframe(db.get_email_audit_logs(10), use_container_width=True, hide_index=True)
-
-            # Action 4: Edit Metadata
-            with act4:
-                with st.form(f"edit_form_{target_id}"):
-                    ed_title = st.text_input("Title", value=target_row["title"])
-                    ed_class = st.selectbox("Class of Document", ["Evidence & Investigation", "Medical & Health Records", "Legal & Pleadings", "Financial & Proof of Loss", "Policy & Contracts", "Regulatory & Compliance", "Adjuster Field Notes"], index=0)
-                    ed_type = st.selectbox("Type of Document", ["PDF Document", "Photographic Image", "Spreadsheet / Loss Run", "Word Doc / Text", "Digital Notice / Email"], index=0)
-                    ed_lob = st.selectbox("LOB Type", ["GL (General Liability)", "WC (Workers' Comp)", "VA (Commercial Vehicle Auto)", "PD (Commercial Property Damage)", "Cross-LOB / Commercial Package"], index=0)
-                    ed_claim_type = st.selectbox("Claim Type", ["Bodily Injury", "Property Damage", "Catastrophic / High Exposure", "Workers' Indemnity & Lost Time", "Subrogation / Third-Party Recovery", "Uninsured Motorist", "Environmental / Hazmat"], index=0)
-                    ed_status = st.selectbox("Verification Status", ["Verified & Stamped", "Under Legal Review", "Pending Adjuster Review", "Archived"], index=0)
-                    ed_notes = st.text_area("Notes", value=target_row["notes"])
-                    
-                    if st.form_submit_button("💾 Save Metadata Changes to Database", type="primary"):
-                        db.update_document_metadata(target_id, {
-                            "title": ed_title,
-                            "class_of_document": ed_class,
-                            "type_of_document": ed_type,
-                            "lob_type": ed_lob,
-                            "claim_type": ed_claim_type,
-                            "status": ed_status,
-                            "notes": ed_notes
-                        })
-                        st.success(f"✅ Document **{target_id}** updated in database!")
-                        st.rerun()
 
 
-# ==========================================================
-# ZONE 2: MAINTENANCE ZONE
-# ==========================================================
-elif app_zone == "🏢 Maintenance Zone":
-    st.markdown("""
-        <div class="zone-banner">
-            <h2 style="color: #60a5fa; margin: 0;">🏢 Maintenance Zone</h2>
-            <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 14px;">
-                Master Data Management: Administer corporate entities, clinics, legal defense firms, adverse carriers, and vendors linked across claims.
-            </p>
+@app.post("/api/products")
+@login_required
+def api_create_product():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    try:
+        price = float(data.get("price", 0))
+    except (TypeError, ValueError):
+        return jsonify(error="Invalid price"), 400
+    if not name or len(name) > 150 or price < 0:
+        return jsonify(error="Enter a valid name and non-negative price"), 400
+    product_id = execute(
+        "INSERT INTO products (name, price, created_by) VALUES (%s, %s, %s)",
+        (name, price, request.current_user["id"]),
+    )
+    return jsonify(id=product_id, name=name, price=price), 201
+
+
+@app.get("/admin/users")
+@admin_required
+def users_page():
+    users = query_all(
+        "SELECT id, username, display_name, role, is_active, created_at "
+        "FROM app_users ORDER BY created_at DESC"
+    )
+    rows = []
+    for u in users:
+        state = '<span class="badge">Active</span>' if u["is_active"] else '<span class="badge danger">Inactive</span>'
+        action = ""
+        if u["id"] != request.current_user["id"]:
+            action = """
+            <form class="inline" method="post" action="/admin/users/{}/toggle">
+              <input type="hidden" name="_csrf_token" value="{}">
+              <button type="submit" style="background:#26334c">{}</button>
+            </form>
+            """.format(u["id"], csrf_token(), "Deactivate" if u["is_active"] else "Activate")
+        rows.append("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            u["username"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
+            u["display_name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
+            u["role"].capitalize(), state, action
+        ))
+    content = """
+    <section class="card panel"><h2 style="margin-top:0">Create a user</h2>
+      <p class="muted">Only administrators can provision accounts. There is no public sign-up page.</p>
+      <form method="post" action="/admin/users">
+        <input type="hidden" name="_csrf_token" value="{}">
+        <div class="row">
+          <div><label>Username</label><input name="username" required minlength="3" maxlength="80" pattern="[A-Za-z0-9_.@-]+" autocomplete="off"></div>
+          <div><label>Display name</label><input name="display_name" required maxlength="120"></div>
         </div>
-    """, unsafe_allow_html=True)
-    
-    maint_tab1, maint_tab2 = st.tabs(["👥 Entities Management", "🔍 Search Entities"])
-    
-    with maint_tab1:
-        st.subheader("Create & Manage Corporate Entities")
-        
-        with st.expander("➕ Onboard New Entity into Master Database", expanded=False):
-            with st.form("new_entity_form", clear_on_submit=True):
-                e_c1, e_c2, e_c3 = st.columns(3)
-                with e_c1:
-                    e_name = st.text_input("Entity Legal Name *", placeholder="e.g., Summit Industrial Contracting LLC")
-                    e_type = st.selectbox("Entity Type *", ["Insured Corporation", "Medical Provider / Clinic", "Defense Law Firm", "Subcontractor / Vendor", "Third-Party Adverse Carrier"])
-                with e_c2:
-                    e_tax = st.text_input("Tax ID / EIN", placeholder="EIN-XX-XXXXXXX")
-                    e_contact = st.text_input("Primary Contact Person", placeholder="e.g., Jennifer Adams")
-                with e_c3:
-                    e_email = st.text_input("Corporate Email", placeholder="claims@summitcontracting.com")
-                    e_phone = st.text_input("Phone Number", placeholder="+1 (555) 123-4567")
-                    
-                e_c4, e_c5, e_c6 = st.columns(3)
-                with e_c4:
-                    e_city = st.text_input("City", value="Dallas")
-                with e_c5:
-                    e_state = st.selectbox("State", ["TX", "CA", "NY", "FL", "IL", "OH", "PA", "GA", "NC"])
-                with e_c6:
-                    e_status = st.selectbox("Status", ["Active", "Inactive / Suspended"])
-                    
-                if st.form_submit_button("Register Entity to Database", type="primary"):
-                    if not e_name:
-                        st.error("Entity Legal Name is required.")
-                    else:
-                        ent_id = db.create_entity({
-                            "entity_name": e_name,
-                            "entity_type": e_type,
-                            "tax_id": e_tax,
-                            "primary_contact": e_contact,
-                            "email": e_email,
-                            "phone": e_phone,
-                            "city": e_city,
-                            "state": e_state,
-                            "status": e_status
-                        })
-                        st.success(f"✅ Entity **{e_name}** successfully registered with ID **{ent_id}**!")
-                        st.rerun()
-
-        st.markdown("##### Current Master Entities Roster")
-        all_entities = db.get_all_entities()
-        st.dataframe(all_entities, use_container_width=True, hide_index=True)
-
-    with maint_tab2:
-        st.subheader("Search & Query Entities")
-        
-        sq1, sq2 = st.columns([1, 2])
-        with sq1:
-            ent_filter_types = st.multiselect("Filter by Entity Type", options=["Insured Corporation", "Medical Provider / Clinic", "Defense Law Firm", "Subcontractor / Vendor", "Third-Party Adverse Carrier"])
-        with sq2:
-            ent_search_term = st.text_input("Search by Name, City, or Contact", placeholder="e.g., Apex, Dallas, Katherine...")
-            
-        filtered_entities = db.get_all_entities(type_filter=ent_filter_types if ent_filter_types else None, search=ent_search_term if ent_search_term else None)
-        st.dataframe(filtered_entities, use_container_width=True, hide_index=True)
+        <div class="row"><div><label>Temporary password (12+ characters)</label><input name="password" type="password" required minlength="12" autocomplete="new-password"></div>
+        <div><label>Role</label><select name="role"><option value="user">User</option><option value="admin">Admin</option></select></div></div>
+        <button type="submit" style="margin-top:18px">Create account +</button>
+      </form>
+    </section>
+    <section class="card panel"><h2 style="margin-top:0">Workspace access</h2>
+      <table><thead><tr><th>Username</th><th>Display name</th><th>Role</th><th>Status</th><th>Action</th></tr></thead>
+      <tbody>{}</tbody></table>
+    </section>
+    """.format(csrf_token(), "".join(rows))
+    return page("User access", "users", content)
 
 
-# ==========================================================
-# ZONE 3: SECURITY ZONE
-# ==========================================================
-elif app_zone == "🔐 Security Zone":
-    st.markdown("""
-        <div class="zone-banner">
-            <h2 style="color: #60a5fa; margin: 0;">🔐 Security & Access Control Zone</h2>
-            <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 14px;">
-                Role-Based Access Control (RBAC): Administer user accounts, financial reserve sign-off authorities, and system permissions.
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    st.subheader("User Account & Authority Provisioning")
-    
-    with st.expander("👤 Provision New User Account", expanded=False):
-        with st.form("new_user_form", clear_on_submit=True):
-            u_c1, u_c2, u_c3 = st.columns(3)
-            with u_c1:
-                u_name = st.text_input("Full Name *", placeholder="e.g., Amanda Foster")
-                u_username = st.text_input("Username *", placeholder="e.g., afoster")
-            with u_c2:
-                u_email = st.text_input("Corporate Email *", placeholder="afoster@novasure.internal")
-                u_role = st.selectbox("Assigned Role *", ["Senior Claims Adjuster", "Lead Systems Analyst", "Claims Triage Specialist", "Legal Counsel Liaison", "Compliance Auditor", "Claims Admin"])
-            with u_c3:
-                u_reserve_auth = st.number_input("Maximum Reserve Authority ($) *", min_value=5000, max_value=500000, value=50000, step=5000)
-                u_perms = st.selectbox("Permission Tier", ["Full Admin & Policy Overrides", "Claims Create, Edit, Reserve Authority P2", "FNOL Intake & Schema Validation", "Legal Hold & Defense Stance", "Read-Only Compliance Auditor"])
-                
-            if st.form_submit_button("Create User Account in Database", type="primary"):
-                if not u_name or not u_username or not u_email:
-                    st.error("Please fill in mandatory user credentials.")
-                else:
-                    new_uid = db.create_user({
-                        "full_name": u_name,
-                        "username": u_username,
-                        "email": u_email,
-                        "role": u_role,
-                        "reserve_authority": u_reserve_auth,
-                        "permissions": u_perms,
-                        "status": "Active"
-                    })
-                    st.success(f"✅ User **{u_name}** ({new_uid}) successfully enrolled in database!")
-                    st.rerun()
-
-    st.markdown("##### Authorized User Roster & RBAC Directory")
-    users_df = db.get_all_users()
-    st.dataframe(users_df, use_container_width=True, hide_index=True)
-
-
-# ==========================================================
-# ZONE 4: DASHBOARD ZONE
-# ==========================================================
-elif app_zone == "📊 Dashboard Zone":
-    st.markdown("""
-        <div class="zone-banner">
-            <h2 style="color: #60a5fa; margin: 0;">📊 Executive Dashboard & Analytics Zone</h2>
-            <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 14px;">
-                Demonstrating Business Analysis, SDLC, STLC, and automated triage KPI metrics reducing manual processing overhead.
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    kpis = db.get_dashboard_kpis()
-    
-    # Executive KPI Metric Cards
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Intake Cycle Time", "3.2 Hours", "-87% (Was 2.5 Days)")
-    k2.metric("Clerical Error Rate", "1.1%", "-7.1% vs Manual Baseline")
-    k3.metric("Total Active Claims", f"{kpis['total_claims']:,}")
-    dashboard_total_incurred = pd.to_numeric(
-        pd.Series([kpis.get("total_incurred", 0)]).astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False),
-        errors="coerce",
-    ).fillna(0).iloc[0]
-    k4.metric("Total Incurred Reserves", f"${float(dashboard_total_incurred):,.0f}")
-    
-    st.divider()
-    
-    # Visual Analytics Grid
-    d_c1, d_c2 = st.columns(2)
-    
-    with d_c1:
-        st.subheader("Distribution by Line of Business (LOB)")
-        lob_data = kpis["lob_stats"]
-        if not lob_data.empty:
-            st.bar_chart(lob_data.set_index("LOB")["Count"])
-            st.dataframe(lob_data, use_container_width=True, hide_index=True)
-        else:
-            st.info("No claims in database.")
-
-    with d_c2:
-        st.subheader("Adjuster Capacity & Caseload Utilization")
-        adj_data = kpis["adjusters"]
-        if not adj_data.empty:
-            st.dataframe(adj_data.set_index("Name")[["Specialization", "Active Caseload", "Max Capacity"]], use_container_width=True)
-            st.bar_chart(adj_data.set_index("Name")[["Active Caseload", "Max Capacity"]])
-        else:
-            st.info("No adjusters recorded.")
-            
-    st.divider()
-    
-    # Problem & Business Analysis Impact Callout
-    st.subheader("📈 Business Problem & Automation Impact Analysis")
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        st.markdown("##### ⏱️ Processing Delays")
-        st.markdown(
-            "**Manual Baseline:** Paper/PDF intake forms took 2.5–3 business days to enter into downstream adjudication systems.<br />"
-            "**NovaSure Solution:** Digital schema validation and bulk CSV ingestion reduce cycle time to **3.2 hours**.",
-            unsafe_allow_html=True
+@app.post("/admin/users")
+@admin_required
+def create_user():
+    username = request.form.get("username", "").strip()
+    display_name = request.form.get("display_name", "").strip()
+    password = request.form.get("password", "")
+    role = request.form.get("role", "user")
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{3,80}", username):
+        flash("Username must be 3-80 characters and use letters, numbers, dot, underscore, @, or hyphen.")
+        return redirect(url_for("users_page"))
+    if not display_name or len(display_name) > 120 or len(password) < 12:
+        flash("Provide a display name and a password with at least 12 characters.")
+        return redirect(url_for("users_page"))
+    if role not in {"user", "admin"}:
+        abort(400)
+    try:
+        execute(
+            """INSERT INTO app_users
+               (username, display_name, password_hash, role, is_active)
+               VALUES (%s, %s, %s, %s, TRUE)""",
+            (username, display_name, generate_password_hash(password), role),
         )
-    with b2:
-        st.markdown("##### ⚠️ High Error Rates")
-        st.markdown(
-            "**Manual Baseline:** Keying errors averaged 8.2% (incorrect policy IDs, missing claimant legal representation).<br />"
-            "**NovaSure Solution:** Automated regex validation, required field enforcement, and LOB auto-routing drop clerical error to **1.1%**.",
-            unsafe_allow_html=True
-        )
-    with b3:
-        st.markdown("##### 💼 Adjuster Overload")
-        st.markdown(
-            "**Manual Baseline:** Unbalanced manual file distribution led to caseload spikes over 140% of adjuster capacity.<br />"
-            "**NovaSure Solution:** Intelligent auto-routing based on specialization and active caseload caps maintains capacity balance under 80%.",
-            unsafe_allow_html=True
-        )
+    except IntegrityError:
+        flash("That username already exists.")
+        return redirect(url_for("users_page"))
+    flash("Account created. Share credentials with the user securely.")
+    return redirect(url_for("users_page"))
+
+
+@app.post("/admin/users/<int:user_id>/toggle")
+@admin_required
+def toggle_user(user_id):
+    if user_id == request.current_user["id"]:
+        flash("You cannot deactivate your own account.")
+        return redirect(url_for("users_page"))
+    target = query_one("SELECT id, is_active FROM app_users WHERE id = %s", (user_id,))
+    if not target:
+        abort(404)
+    execute(
+        "UPDATE app_users SET is_active = %s WHERE id = %s",
+        (not bool(target["is_active"]), user_id),
+    )
+    flash("User access updated.")
+    return redirect(url_for("users_page"))
+
+
+@app.errorhandler(403)
+def forbidden(_error):
+    return (
+        "<h1>403 — Access denied</h1><p>Your account does not have permission "
+        "to access this page.</p><p><a href='/dashboard'>Return to workspace</a></p>",
+        403,
+    )
+
+
+@app.errorhandler(400)
+def bad_request(error):
+    message = getattr(error, "description", "Bad request")
+    return f"<h1>400 — Request rejected</h1><p>{message}</p>", 400
+
+
+# Initialize tables and optional bootstrap admin for both direct execution and Gunicorn.
+# Configure DB_* environment variables before starting this module.
+init_db()
+
+if __name__ == "__main__":
+    # For production, use Gunicorn behind the ALB instead of Flask's development server.
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
