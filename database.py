@@ -1,4 +1,4 @@
-"""Database layer for secure_catalog_app.py (MySQL / Amazon Aurora MySQL).
+"""Database layer  (MySQL / Amazon Aurora MySQL).
 
 This module intentionally uses the catalog application's own schema and DB_*
 configuration. It does not silently fall back to SQLite: a misconfigured or
@@ -39,7 +39,7 @@ def db_connect():
 
 
 def init_db() -> None:
-    """Create or safely extend the tables used by the secure catalog app."""
+    """Create or safely extend the tables used by the  app."""
     conn = db_connect()
     try:
         cur = conn.cursor()
